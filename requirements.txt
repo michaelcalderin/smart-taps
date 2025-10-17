@@ -1,0 +1,6 @@
+pandas==2.3.0
+matplotlib==3.10.3
+torch==2.7.0+cu118
+torchaudio==2.7.0+cu118
+torchvision==0.22.0+cu118
+datasets==4.1.1
