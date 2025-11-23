@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 import torch.nn.functional as F
-from transformers import CLIPProcessor, CLIPModel
+from transformers import OwlViTProcessor, OwlViTForObjectDetection
 import subprocess
 from datetime import datetime
 import whisper
@@ -12,188 +12,32 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 
-# Model architecture
-class BoundingBoxModel(nn.Module):
-    def __init__(self,
-                 clip_model_name="openai/clip-vit-base-patch32",
-                 freeze_clip=True,
-                 unfreeze_last_n_vision_layers=0,
-                 unfreeze_last_n_text_layers=0,
-                 device="cuda",
-                 max_box_width=1,
-                 max_box_height=1):
-        super().__init__()
-        self.device = device
-        self.clip = CLIPModel.from_pretrained(clip_model_name)
-        self.processor = CLIPProcessor.from_pretrained(clip_model_name)
-        
-        self.freeze_clip = freeze_clip
-        self.unfreeze_last_n_vision_layers = unfreeze_last_n_vision_layers
-        self.unfreeze_last_n_text_layers = unfreeze_last_n_text_layers
 
-        self.max_box_width = max_box_width
-        self.max_box_height = max_box_height
-
-        embed_dim = self.clip.config.projection_dim
-
-        # Freeze CLIP
-        if self.freeze_clip:
-            for param in self.clip.parameters():
-                param.requires_grad = False
-            
-            # Unfreeze last N vision layers if specified
-            if self.unfreeze_last_n_vision_layers > 0:
-                vision_layers = self.clip.vision_model.encoder.layers
-                for layer in vision_layers[-self.unfreeze_last_n_vision_layers:]:
-                    for param in layer.parameters():
-                        param.requires_grad = True
-                print(f"Unfroze last {self.unfreeze_last_n_vision_layers} vision layers")
-            
-            # Unfreeze last N text layers if specified
-            if self.unfreeze_last_n_text_layers > 0:
-                text_layers = self.clip.text_model.encoder.layers
-                for layer in text_layers[-self.unfreeze_last_n_text_layers:]:
-                    for param in layer.parameters():
-                        param.requires_grad = True
-                print(f"Unfroze last {self.unfreeze_last_n_text_layers} text layers")
-
-        # Fusion and prediction head
-        self.fusion = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-        )
-
-        # Bounding box regression head
-        self.bbox_head = nn.Linear(256, 4)
-
-    def forward(self, images, texts, targets=None, visualize=False, batch_idx=0, loss_value=None):
-        # Encode text
-        text_inputs = self.processor(
-            text=texts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True
-        ).to(self.device)
-        
-        with torch.set_grad_enabled(not self.freeze_clip or self.unfreeze_last_n_text_layers > 0):
-            text_embeds = self.clip.get_text_features(**text_inputs)
-        text_embeds = F.normalize(text_embeds, dim=-1)
-
-        # Encode images (already 224x224 with padding)
-        image_inputs = self.processor(
-            images=images, 
-            return_tensors="pt"
-        ).to(self.device)
-        
-        with torch.set_grad_enabled(not self.freeze_clip or self.unfreeze_last_n_vision_layers > 0):
-            image_embeds = self.clip.get_image_features(**image_inputs)
-        image_embeds = F.normalize(image_embeds, dim=-1)
-
-        # Combine image and text embeddings
-        combined = torch.cat([image_embeds, text_embeds], dim=-1)
-        features = self.fusion(combined)
-
-        # Predict bounding box in center + size format
-        bbox_params = self.bbox_head(features)
-        
-        # Convert to (x1, y1, x2, y2) format with sigmoid for [0,1] range
-        cx = torch.sigmoid(bbox_params[:, 0])
-        cy = torch.sigmoid(bbox_params[:, 1])
-        w = torch.sigmoid(bbox_params[:, 2]) * self.max_box_width # Model tends to predict big boxes and doesn't learn so this will restrict size
-        h = torch.sigmoid(bbox_params[:, 3]) * self.max_box_height
-        
-        # Convert center + size to corners
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        
-        # Clamp to [0, 1]
-        x1 = torch.clamp(x1, 0, 1)
-        y1 = torch.clamp(y1, 0, 1)
-        x2 = torch.clamp(x2, 0, 1)
-        y2 = torch.clamp(y2, 0, 1)
-        
-        bbox = torch.stack([x1, y1, x2, y2], dim=1)
-        return bbox
-
-
-def pad_image_to_square(image, target_size=224, fill_color=(0, 0, 0)):
+def convert_bbox_to_device_coords(bbox_norm, device_w, device_h):
     """
-    Pad image to square while maintaining aspect ratio.
-    Returns padded image and padding info for coordinate conversion.
-    """
-
-    w, h = image.size
-    max_dim = max(w, h)
-    scale = target_size / max_dim
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    
-    image = image.resize((new_w, new_h), Image.BILINEAR)
-    padded_image = Image.new('RGB', (target_size, target_size), fill_color)
-    
-    paste_x = (target_size - new_w) // 2
-    paste_y = (target_size - new_h) // 2
-    padded_image.paste(image, (paste_x, paste_y))
-    
-    return padded_image, (paste_x, paste_y, new_w, new_h, scale)
-
-
-def convert_bbox_to_device_coords(bbox_224, padding_info, device_w, device_h, target_size=224):
-    """
-    Convert bounding box from 224x224 padded space back to original device coordinates.
-    Works for any device dimensions, not just the original 1080x1920 training data.
+    Convert bounding box from normalized [0,1] space to device pixel coordinates.
+    OWL-ViT processor resizes images to 768x768 with non-uniform scaling (squashing),
+    so we directly scale normalized coordinates to device dimensions.
     
     Args:
-        bbox_224: (x1, y1, x2, y2) in 224x224 normalized [0,1] space
-        padding_info: (paste_x, paste_y, new_w, new_h, scale) from pad_image_to_square
-        device_w, device_h: current device width and height (can be any dimensions)
-        target_size: model input size (224)
+        bbox_norm: (x1, y1, x2, y2) in normalized [0,1] space
+        device_w, device_h: device width and height in pixels
     
     Returns:
         (x1, y1, x2, y2) in device pixel coordinates
     """
-
-    paste_x, paste_y, new_w, new_h, scale = padding_info
+    x1 = bbox_norm[0] * device_w
+    y1 = bbox_norm[1] * device_h
+    x2 = bbox_norm[2] * device_w
+    y2 = bbox_norm[3] * device_h
     
-    # Convert from normalized [0,1] to absolute pixels in 224x224 space
-    x1_224 = bbox_224[0] * target_size
-    y1_224 = bbox_224[1] * target_size
-    x2_224 = bbox_224[2] * target_size
-    y2_224 = bbox_224[3] * target_size
+    # Clamp to device bounds
+    x1 = max(0, min(device_w, x1))
+    y1 = max(0, min(device_h, y1))
+    x2 = max(0, min(device_w, x2))
+    y2 = max(0, min(device_h, y2))
     
-    # Remove padding offset to get coordinates in the resized (but unpadded) space
-    x1_unpadded = x1_224 - paste_x
-    y1_unpadded = y1_224 - paste_y
-    x2_unpadded = x2_224 - paste_x
-    y2_unpadded = y2_224 - paste_y
-    
-    # Clamp to valid range in unpadded space ... ensures coords stay within actual image area (not in padding)
-    x1_unpadded = max(0, min(new_w, x1_unpadded))
-    y1_unpadded = max(0, min(new_h, y1_unpadded))
-    x2_unpadded = max(0, min(new_w, x2_unpadded))
-    y2_unpadded = max(0, min(new_h, y2_unpadded))
-    
-    # Unscale to current device dimensions
-    x1_device = x1_unpadded / scale
-    y1_device = y1_unpadded / scale
-    x2_device = x2_unpadded / scale
-    y2_device = y2_unpadded / scale
-    
-    # Final clamp to ensure coords are within device bounds
-    x1_device = max(0, min(device_w, x1_device))
-    y1_device = max(0, min(device_h, y1_device))
-    x2_device = max(0, min(device_w, x2_device))
-    y2_device = max(0, min(device_h, y2_device))
-    
-    return (x1_device, y1_device, x2_device, y2_device)
+    return (x1, y1, x2, y2)
 
 
 def record_audio(duration=3, sample_rate=16000):
@@ -361,16 +205,11 @@ class ADBDevice:
         )
 
 def load_model(model_path, device):
-    """Load the trained model."""
-
-    model = BoundingBoxModel(
-        device=device,
-        freeze_clip=True,
-        unfreeze_last_n_vision_layers=4,
-        unfreeze_last_n_text_layers=4,
-        max_box_width=0.25,
-        max_box_height=0.25
-    ).to(device)
+    """Load the trained OWL-ViT model."""
+    
+    model_name = "google/owlvit-base-patch32"
+    processor = OwlViTProcessor.from_pretrained(model_name)
+    model = OwlViTForObjectDetection.from_pretrained(model_name).to(device)
     
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -379,16 +218,17 @@ def load_model(model_path, device):
     print(f"Model loaded from epoch {checkpoint['epoch']+1}")
     print(f"Validation IoU: {checkpoint['val_iou']:.4f}")
     
-    return model
+    return model, processor
 
 
-def predict_and_tap(text_query, model, adb_device, screenshot_dir="../ui/screenshots"):
+def predict_and_tap(text_query, model, processor, adb_device, screenshot_dir="../ui/screenshots"):
     """
     Main function: capture screenshot, predict bounding box, and tap.
     
     Args:
         text_query: Text description of what to click
-        model: Trained BoundingBoxModel
+        model: Trained OWL-ViT model
+        processor: OWL-ViT processor
         adb_device: ADBDevice instance
         screenshot_dir: Directory to save screenshots
     """
@@ -406,25 +246,56 @@ def predict_and_tap(text_query, model, adb_device, screenshot_dir="../ui/screens
     print(f"Screenshot saved: {screenshot_path}")
     print(f"Device resolution: {device_w}x{device_h}")
     
-    # Prepare image for model
-    print("\nProcessing image...")
-    padded_image, padding_info = pad_image_to_square(screenshot, target_size=224)
-    paste_x, paste_y, new_w, new_h, scale = padding_info
-    print(f"Padding info: paste=({paste_x}, {paste_y}), size=({new_w}, {new_h}), scale={scale:.4f}")
-    
-    # Run model prediction
+    # Run model prediction (OWL-ViT processor handles resizing to 768x768)
     print("\nRunning model prediction...")
+    device = next(model.parameters()).device
+    
+    # Ensure screenshot is in RGB mode (processor requirement)
+    if screenshot.mode != 'RGB':
+        screenshot = screenshot.convert('RGB')
+    
+    # Process image and text (processor will resize to 768x768 with non-uniform scaling)
+    inputs = processor(
+        text=[text_query],
+        images=[screenshot],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=16
+    ).to(device)
+    
     with torch.no_grad():
-        pred_bbox = model([padded_image], [text_query])
+        outputs = model(**inputs)
     
-    # Get prediction in 224x224 normalized space
-    bbox_224_norm = pred_bbox[0].cpu().numpy()
-    print(f"Predicted bbox (224x224 normalized): [{bbox_224_norm[0]:.4f}, {bbox_224_norm[1]:.4f}, {bbox_224_norm[2]:.4f}, {bbox_224_norm[3]:.4f}]")
+    # Outputs
+    logits = outputs.logits[0, :, 0]
+    pred_boxes = outputs.pred_boxes[0]
     
-    # Convert to device coordinates
-    x1, y1, x2, y2 = convert_bbox_to_device_coords(
-        bbox_224_norm, padding_info, device_w, device_h
-    )
+    # Get the patch with highest score for tapping
+    best_patch_idx = logits.argmax()
+    best_box = pred_boxes[best_patch_idx].cpu().numpy()  # [cx, cy, w, h] normalized [0,1]
+    best_score = torch.sigmoid(logits[best_patch_idx]).item()
+    
+    # Get top 3 predictions for visualization
+    top3_indices = torch.topk(logits, k=min(3, len(logits))).indices
+    top3_boxes = pred_boxes[top3_indices].cpu().numpy()
+    top3_scores = torch.sigmoid(logits[top3_indices]).cpu().numpy()
+    
+    print(f"Best prediction score: {best_score:.4f}")
+    print(f"Predicted bbox (center + size, normalized): [cx={best_box[0]:.4f}, cy={best_box[1]:.4f}, w={best_box[2]:.4f}, h={best_box[3]:.4f}]")
+    
+    # Convert from center+size to corner format for visualization
+    cx, cy, w, h = best_box
+    x1_norm = cx - w / 2
+    y1_norm = cy - h / 2
+    x2_norm = cx + w / 2
+    y2_norm = cy + h / 2
+    
+    bbox_norm = np.array([x1_norm, y1_norm, x2_norm, y2_norm])
+    print(f"Predicted bbox (corners, normalized): [{x1_norm:.4f}, {y1_norm:.4f}, {x2_norm:.4f}, {y2_norm:.4f}]")
+    
+    # Convert to device coordinates (simple scaling since processor squashes to 768x768)
+    x1, y1, x2, y2 = convert_bbox_to_device_coords(bbox_norm, device_w, device_h)
     print(f"Converted bbox (device coords): [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
     
     # Calculate center point and tap
@@ -437,74 +308,61 @@ def predict_and_tap(text_query, model, adb_device, screenshot_dir="../ui/screens
     adb_device.tap(center_x, center_y)
     print("Tap executed!")
     
-    # Create figure with padded 224x224 view and normal view of predicted bounding box
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    # Create visualization figure
+    fig, ax = plt.subplots(1, 1, figsize=(10, 12))
     
-    # Left side: 224x224 padded image with prediction
-    ax1 = axes[0]
-    padded_array = torch.tensor(np.array(padded_image)).permute(2, 0, 1).float() / 255.0
+    # Show device screenshot with prediction
+    ax.imshow(screenshot)
     
-    # Apply CLIP normalization for visualization
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
-    normalized_array = (padded_array - mean) / std
+    # Draw all top 3 predictions
+    colors = ['red', 'orange', 'yellow']
+    linestyles = ['--', '-.', ':']
+    linewidths = [4, 3, 2]
     
-    # Denormalize back for display
-    display_array = normalized_array * std + mean
-    display_array = torch.clamp(display_array, 0, 1).permute(1, 2, 0).numpy()
+    for rank, (box, score) in enumerate(zip(top3_boxes, top3_scores)):
+        # Convert from center+size to corner format
+        cx, cy, w, h = box
+        x1_norm = cx - w / 2
+        y1_norm = cy - h / 2
+        x2_norm = cx + w / 2
+        y2_norm = cy + h / 2
+        
+        # Convert to device coordinates
+        bbox_norm = np.array([x1_norm, y1_norm, x2_norm, y2_norm])
+        x1_pred, y1_pred, x2_pred, y2_pred = convert_bbox_to_device_coords(bbox_norm, device_w, device_h)
+        
+        # Draw bounding box
+        pred_w = x2_pred - x1_pred
+        pred_h = y2_pred - y1_pred
+        
+        rect = patches.Rectangle(
+            (x1_pred, y1_pred), pred_w, pred_h,
+            linewidth=linewidths[rank], edgecolor=colors[rank], 
+            facecolor='none', linestyle=linestyles[rank],
+            label=f'#{rank+1}: {score:.3f}'
+        )
+        ax.add_patch(rect)
+        
+        # Draw center point for top-1 prediction (the one we're tapping)
+        if rank == 0:
+            center_x_pred = (x1_pred + x2_pred) / 2
+            center_y_pred = (y1_pred + y2_pred) / 2
+            ax.plot(center_x_pred, center_y_pred, 'ro', markersize=12, 
+                   markeredgecolor='white', markeredgewidth=2)
     
-    ax1.imshow(display_array)
+    # Add legend
+    ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
     
-    # Draw prediction box on 224x224 image (convert normalized to pixels)
-    pred_x1_224 = bbox_224_norm[0] * 224
-    pred_y1_224 = bbox_224_norm[1] * 224
-    pred_x2_224 = bbox_224_norm[2] * 224
-    pred_y2_224 = bbox_224_norm[3] * 224
-    pred_w_224 = pred_x2_224 - pred_x1_224
-    pred_h_224 = pred_y2_224 - pred_y1_224
-    
-    rect_224 = patches.Rectangle(
-        (pred_x1_224, pred_y1_224), pred_w_224, pred_h_224,
-        linewidth=3, edgecolor='red', facecolor='none', linestyle='--'
+    # Add title with details
+    ax.set_title(
+        f'Query: "{text_query}" (Score: {best_score:.2f})\n'
+        f'Device: {device_w}x{device_h} | Tap: ({center_x:.1f}, {center_y:.1f})\n'
+        f'Box: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]',
+        fontsize=12, fontweight='bold', pad=15
     )
-    ax1.add_patch(rect_224)
-    
-    # Draw center point
-    center_x_224 = (pred_x1_224 + pred_x2_224) / 2
-    center_y_224 = (pred_y1_224 + pred_y2_224) / 2
-    ax1.plot(center_x_224, center_y_224, 'ro', markersize=8, markeredgecolor='white', markeredgewidth=2)
-    
-    ax1.set_title(f'224x224 Padded Image\nPredicted Box: [{pred_x1_224:.1f}, {pred_y1_224:.1f}, {pred_x2_224:.1f}, {pred_y2_224:.1f}]', 
-                  fontsize=12, fontweight='bold')
-    ax1.axis('off')
-    
-    # Right side: Device screenshot with prediction
-    ax2 = axes[1]
-    ax2.imshow(screenshot)
-    
-    # Draw prediction box on device scale
-    pred_w_device = x2 - x1
-    pred_h_device = y2 - y1
-    
-    rect_device = patches.Rectangle(
-        (x1, y1), pred_w_device, pred_h_device,
-        linewidth=4, edgecolor='red', facecolor='none', linestyle='--'
-    )
-    ax2.add_patch(rect_device)
-    
-    # Draw center point
-    ax2.plot(center_x, center_y, 'ro', markersize=12, markeredgecolor='white', markeredgewidth=2)
-    
-    ax2.set_title(f'Device Screenshot ({device_w}x{device_h})\nTap Location: ({center_x:.1f}, {center_y:.1f})', 
-                  fontsize=12, fontweight='bold')
-    ax2.axis('off')
-    
-    # Add overall title
-    fig.suptitle(f'Query: "{text_query}"\nBox: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]', 
-                 fontsize=14, fontweight='bold', y=0.98)
+    ax.axis('off')
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.93)
     
     # Save comparison image
     comparison_path = os.path.join(screenshot_dir, f"comparison_{timestamp}.png")
@@ -540,12 +398,12 @@ def main():
         print(f"Error connecting to device: {e}")
         return
     
-    # Load CLIP model
+    # Load OWL-ViT model
     model_path = "../src/best_bounding_box_model.pth"
-    print(f"\nLoading bounding box model from: {model_path}")
+    print(f"\nLoading OWL-ViT model from: {model_path}")
     
     try:
-        model = load_model(model_path, torch_device)
+        model, processor = load_model(model_path, torch_device)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
@@ -574,7 +432,7 @@ def main():
                 continue
             
             # Execute the tap
-            predict_and_tap(text_query, model, adb_device)
+            predict_and_tap(text_query, model, processor, adb_device)
             
         except Exception as e:
             print(f"Error: {e}")
