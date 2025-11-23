@@ -79,7 +79,7 @@ The SmartTaps system relies on two primary datasets for its multimodal pipeline:
 | Source | [Google Research Screen Annotation Dataset (derived from the RICO dataset)](https://github.com/google-research-datasets/screen_annotation) |
 | Type | Images with UI element annotations (bounding box, labels) |
 | Size | 22,417 annotated Android phone screens |
-| Purpose | Paired with synthetic text commands (generated using an LLM) to create training data <br>(Text Command, Screenshot) → Coordinates to Tap. |
+| Purpose | Used to create training data <br>(Text Command, Screenshot) → Coordinates to Tap. |
 
 ## Replicating the Project (Optional)
 
